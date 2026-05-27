@@ -1,0 +1,19 @@
+﻿.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# 本地向量库数据通常较大，不建议提交
+storage/chroma_db/*
+!storage/chroma_db/.gitkeep
+
+# 日志文件
+logs/
