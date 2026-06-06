@@ -2,6 +2,10 @@
 # rag_pipeline.py — 流程编排器（门面模式 Facade Pattern）
 # 将检索（Retriever）和生成（Generator）串联为一个统一的问答接口。
 # 核心设计：单一入口 ask() 方法 + 结构化返回 + 引用来源构建
+#
+# 包含两个 Pipeline：
+# 1. RAGPipeline — 原始的简单 RAG 流程（检索 → 生成）
+# 2. AgentRAGPipeline — 增强版 Agent 协同流程（路由 → 改写 → 混合检索 → 生成）
 # =============================================================================
 
 # 从 __future__ 导入 annotations，让所有类型注解使用延迟求值
@@ -9,6 +13,11 @@ from __future__ import annotations
 
 # typing 的类型标注工具：Any（任意类型）、Dict（字典泛型）、List（列表泛型）
 from typing import Any, Dict, List
+
+# httpx：HTTP 客户端，用于创建 OpenAI 客户端
+import httpx
+# OpenAI：OpenAI 官方 SDK
+from openai import OpenAI
 
 # Settings：项目的配置类（只用于类型标注）
 from .config import Settings
@@ -100,3 +109,231 @@ class RAGPipeline:
             "citations": citations,        # 引用来源（精简版，前端展示用）
             "retrieved_chunks": retrieved_chunks,  # 检索原文片段（完整版，调试用）
         }
+
+
+# =============================================================================
+# AgentRAGPipeline — 增强版 Agent 协同流程
+# =============================================================================
+
+class AgentRAGPipeline:
+    """基于多 Agent 协同的增强版 RAG 流程。
+
+    协同流程：
+    1. RouterAgent → 判断问题类型（rag / general / direct）
+    2. QueryRewriteAgent → 改写查询（仅 RAG 类问题）
+    3. HybridRetriever → BM25 + 向量混合检索
+    4. RetrievalAgent → ReAct 循环 + 工具调用 → 生成答案
+
+    对外暴露的接口与 RAGPipeline 一致：ask(question) → dict
+    """
+
+    def __init__(
+        self,
+        hybrid_retriever: Any,   # HybridRetriever 实例
+        settings: Settings,
+    ):
+        self.hybrid_retriever = hybrid_retriever
+        self.settings = settings
+
+        # 创建 OpenAI 客户端（供 Agent 使用）
+        client_kwargs = {"api_key": settings.api_key}
+        if settings.openai_base_url:
+            client_kwargs["base_url"] = settings.openai_base_url
+        self.client = OpenAI(
+            **client_kwargs,
+            http_client=httpx.Client(timeout=120.0),
+        )
+
+        # 创建三个 Agent
+        from .agent_core import RouterAgent, QueryRewriteAgent, RetrievalAgent
+        self.router = RouterAgent(self.client, settings.llm_model)
+        self.rewriter = QueryRewriteAgent(self.client, settings.llm_model)
+        self.retrieval_agent = RetrievalAgent(
+            self.client, settings.llm_model, settings.agent_max_iterations,
+        )
+
+        # 初始化工具的全局引用
+        from .agent_tools import init_tools
+        init_tools(hybrid_retriever, settings.docs_dir)
+
+    def ask(self, question: str) -> Dict[str, Any]:
+        """Agent 协同问答入口。
+
+        流程：路由决策 → 查询改写 → 混合检索 → Agent 生成答案
+        """
+        from .agent_core import AgentStep
+
+        # ---- Step 0：问题预处理 ----
+        clean_question = question.strip()
+        if not clean_question:
+            return {
+                "answer": "请输入有效问题。",
+                "citations": [],
+                "retrieved_chunks": [],
+                "agent_steps": [],
+                "route": "direct",
+            }
+
+        agent_steps: List[AgentStep] = []
+
+        # ---- Step 1：路由决策 ----
+        route_result = self.router.route(clean_question)
+        route = route_result["route"]
+        reason = route_result["reason"]
+
+        agent_steps.append(AgentStep(
+            agent_name="Router",
+            step_type="think",
+            content=f"问题类型: {route} | 理由: {reason}",
+        ))
+
+        # ---- Step 2：直接回答（问候/闲聊） ----
+        if route == "direct":
+            answer = self._handle_direct(clean_question)
+            return {
+                "answer": answer,
+                "citations": [],
+                "retrieved_chunks": [],
+                "agent_steps": agent_steps,
+                "route": route,
+            }
+
+        # ---- Step 3：通用知识回答 ----
+        if route == "general":
+            answer = self._handle_general(clean_question)
+            return {
+                "answer": answer,
+                "citations": [],
+                "retrieved_chunks": [],
+                "agent_steps": agent_steps,
+                "route": route,
+            }
+
+        # ---- Step 4：RAG 通道——查询改写 ----
+        rewrite_result = self.rewriter.rewrite(clean_question)
+        queries = rewrite_result["queries"]
+        explanation = rewrite_result["explanation"]
+
+        agent_steps.append(AgentStep(
+            agent_name="QueryRewrite",
+            step_type="think",
+            content=f"改写查询: {queries} | 理由: {explanation}",
+        ))
+
+        # ---- Step 5：混合检索（使用所有改写后的查询） ----
+        all_chunks = []
+        seen_texts = set()
+        for q in queries:
+            chunks = self.hybrid_retriever.retrieve(q)
+            for chunk in chunks:
+                if chunk.text not in seen_texts:
+                    seen_texts.add(chunk.text)
+                    all_chunks.append(chunk)
+
+        agent_steps.append(AgentStep(
+            agent_name="Retrieval",
+            step_type="observation",
+            content=f"混合检索完成，获取 {len(all_chunks)} 个相关文档片段",
+        ))
+
+        # ---- Step 6：构建上下文 ----
+        if not chunks:
+            return {
+                "answer": NO_CONTEXT_MSG,
+                "citations": [],
+                "retrieved_chunks": [],
+                "agent_steps": agent_steps,
+                "route": route,
+                "rewritten_query": queries[0] if queries else None,
+            }
+
+        context_blocks = []
+        for idx, chunk in enumerate(all_chunks, start=1):
+            block = (
+                f"[{idx}] 来源文件: {chunk.source}\n"
+                f"路径: {chunk.filepath}\n"
+                f"内容: {chunk.text}"
+            )
+            context_blocks.append(block)
+        context_text = "\n\n".join(context_blocks)
+
+        # ---- Step 7：RetrievalAgent 生成答案 ----
+        tools_desc = (
+            "1. search_knowledge(query, source_file, file_type, max_results) - 【核心】混合检索知识库\n"
+            "2. expand_context(query, context_size) - 扩展检索上下文，获取更多相关片段\n"
+            "3. extract_code(query, language) - 提取相关代码示例\n"
+            "4. compare_sources(query) - 对比不同来源对同一问题的说法\n"
+            "5. entity_lookup(term) - 查找技术术语的定义和用法\n"
+            "6. document_outline(filename) - 查看文档目录结构\n"
+            "7. knowledge_stats() - 查看知识库统计信息"
+        )
+
+        agent_result = self.retrieval_agent.run(
+            query=clean_question,
+            context=context_text,
+            tools_description=tools_desc,
+        )
+        answer = agent_result["answer"]
+        agent_steps.extend(agent_result.get("steps", []))
+
+        # ---- Step 8：构建 citations ----
+        citations: List[Dict[str, Any]] = []
+        retrieved_chunks: List[Dict[str, Any]] = []
+        for chunk in all_chunks:
+            citations.append({
+                "source": chunk.source,
+                "filepath": chunk.filepath,
+                "snippet": truncate_text(chunk.text, max_length=180),
+                "score": round(chunk.score, 4),
+            })
+            retrieved_chunks.append({
+                "text": chunk.text,
+                "score": chunk.score,
+                "source": chunk.source,
+                "filepath": chunk.filepath,
+                "metadata": chunk.metadata,
+            })
+
+        return {
+            "answer": answer,
+            "citations": citations,
+            "retrieved_chunks": retrieved_chunks,
+            "agent_steps": agent_steps,
+            "route": route,
+            "rewritten_query": queries[0] if queries else None,
+        }
+
+    def _handle_direct(self, question: str) -> str:
+        """处理直接回答（问候/闲聊）。"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.settings.llm_model,
+                temperature=0.7,
+                messages=[
+                    {"role": "system", "content": "你是一个友好的技术文档助手。简洁回复用户的问候。"},
+                    {"role": "user", "content": question},
+                ],
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception:
+            return "你好！我是技术文档助手，有什么技术问题可以帮你解答？"
+
+    def _handle_general(self, question: str) -> str:
+        """处理通用技术知识问题。"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.settings.llm_model,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": (
+                        "你是一个技术文档助手。请基于你的知识回答技术问题。"
+                        "回答简洁、专业、面向工程实践。"
+                        "如果不确定，坦诚告知。"
+                    )},
+                    {"role": "user", "content": question},
+                ],
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.exception("通用回答失败: %s", exc)
+            return "回答时出现错误，请稍后重试。"

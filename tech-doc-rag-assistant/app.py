@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # app.py — Streamlit 前端入口
 # 基于 Streamlit 构建的交互式 Chat UI，是整个 RAG 系统的用户界面。
 # 核心设计：侧边栏状态面板 + Chat 对话区 + Session State 管理 + 引用来源展示
@@ -34,7 +34,11 @@ except Exception:
 
 # ---- 导入项目核心模块 ----
 # 从 src 包导入所有需要的公共 API（由 __init__.py 统一导出）
-from src import DocumentLoader, IndexManager, RAGPipeline, TechDocRetriever, get_settings
+from src import (
+    AgentRAGPipeline, BM25Retriever, DocumentLoader,
+    HybridRetriever, IndexManager, RAGPipeline,
+    TechDocRetriever, get_settings,
+)
 # 导入项目的统一日志器
 from src.logger import logger
 
@@ -160,8 +164,8 @@ st.markdown("""
 # ---- 系统初始化函数 ----
 
 def build_pipeline(force_rebuild: bool = False) -> dict:
-    """加载文档并初始化 RAG 流程。
-    这是整个系统的启动链路——配置→加载→索引→检索器→Pipeline"""
+    """加载文档并初始化 RAG 流程（Agent 协同模式）。
+    启动链路：配置→加载→索引→BM25 语料→向量检索器→BM25 检索器→混合检索器→Agent Pipeline"""
 
     # Step 1：加载配置（@lru_cache 保证只加载一次 .env）
     settings = get_settings()
@@ -180,22 +184,41 @@ def build_pipeline(force_rebuild: bool = False) -> dict:
         # 默认模式：已有索引则复用，没有则构建（最常用的逻辑）
         index = index_manager.get_or_create_index(documents)
 
-    # Step 4：创建检索器（配置检索参数）
-    retriever = TechDocRetriever(
+    # Step 4：创建向量检索器（配置检索参数）
+    vector_retriever = TechDocRetriever(
         index=index,
         top_k=settings.top_k,                         # 返回 Top-4 个最相关片段
         similarity_threshold=settings.similarity_threshold,  # 相似度阈值 0.45
     )
 
-    # Step 5：创建 RAGPipeline（流程编排器）
-    pipeline = RAGPipeline(retriever=retriever, settings=settings)
+    # Step 5：创建 BM25 检索器并构建索引
+    bm25_retriever = BM25Retriever()
+    bm25_corpus = index_manager.get_bm25_corpus()
+    if bm25_corpus:
+        bm25_retriever.build_index(bm25_corpus)
+
+    # Step 6：创建混合检索器（BM25 + 向量 + RRF 融合）
+    hybrid_retriever = HybridRetriever(
+        vector_retriever=vector_retriever,
+        bm25_retriever=bm25_retriever,
+        top_k=settings.top_k,
+        rrf_k=settings.rrf_k,
+        similarity_threshold=0.0,  # 融合后不做额外过滤，让 RRF 分数自然排序
+    )
+
+    # Step 7：创建 AgentRAGPipeline（Agent 协同流程编排器）
+    pipeline = AgentRAGPipeline(
+        hybrid_retriever=hybrid_retriever,
+        settings=settings,
+    )
 
     # 返回初始化结果字典——前端用这些信息展示系统状态
     return {
         "settings": settings,           # 完整配置对象
-        "pipeline": pipeline,           # RAG Pipeline 实例（核心入口）
+        "pipeline": pipeline,           # Agent RAG Pipeline 实例（核心入口）
         "doc_count": len(documents),    # 成功加载的文档数量
         "index_status": index_manager.get_index_status(),  # 索引状态信息
+        "bm25_corpus_size": len(bm25_corpus),  # BM25 语料库大小
     }
 
 
@@ -212,6 +235,7 @@ def init_state(force_rebuild: bool = False) -> None:
     st.session_state.pipeline = state["pipeline"]
     st.session_state.doc_count = state["doc_count"]
     st.session_state.index_status = state["index_status"]
+    st.session_state.bm25_corpus_size = state.get("bm25_corpus_size", 0)
 
 
 # ---- Session State 初始化 ----
@@ -283,15 +307,32 @@ with st.sidebar:
     with col3:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value">4</div>
+            <div class="metric-value">{st.session_state.settings.top_k}</div>
             <div class="metric-label">Top-K</div>
         </div>
         """, unsafe_allow_html=True)
     with col4:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value">512</div>
+            <div class="metric-value">{st.session_state.settings.chunk_size}</div>
             <div class="metric-label">Chunk Size</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    col5, col6 = st.columns(2)  # 第三行两列
+    with col5:
+        bm25_size = st.session_state.get("bm25_corpus_size", 0)
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">{bm25_size}</div>
+            <div class="metric-label">BM25 语料</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col6:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">Hybrid</div>
+            <div class="metric-label">检索模式</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -366,33 +407,75 @@ for message in st.session_state.messages:
         # 显示消息的文本内容（支持 Markdown 格式）
         st.markdown(message["content"])
 
-        # 如果是助手消息且有引用来源，展示引用区域
-        if message["role"] == "assistant" and message.get("citations"):
-            # st.expander：折叠面板——默认收起，用户点击展开查看引用详情
-            with st.expander(f"查看引用来源 ({len(message['citations'])})"):
-                # 遍历每条引用
-                for idx, item in enumerate(message["citations"], 1):
-                    # 将相似度分数（0~1）转为百分比（0~100）
-                    score_pct = int(item["score"] * 100)
-                    # 根据百分比分档显示不同颜色：
-                    # >= 70% → 绿色（高相关度）
-                    # >= 50% → 橙色（中等相关度）
-                    # < 50%  → 灰色（低相关度）
-                    score_color = "#10b981" if score_pct >= 70 else "#f59e0b" if score_pct >= 50 else "#94a3b8"
-                    # 渲染引用卡片
-                    st.markdown(f"""
-                    <div class="citation-box">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                            <strong style="color:#1a1f36;">{idx}. {item['source']}</strong>
-                            <span class="citation-score" style="background:{score_color}18;color:{score_color};">
-                                相关度 {score_pct}%
-                            </span>
+        # 如果是助手消息，展示额外信息
+        if message["role"] == "assistant":
+            # 显示路由标签（如果有）
+            route = message.get("route")
+            if route:
+                route_labels = {
+                    "rag": ("  知识库检索", "#4f6ef6"),
+                    "general": ("  通用知识", "#10b981"),
+                    "direct": ("  直接回答", "#f59e0b"),
+                }
+                route_label, route_color = route_labels.get(route, ("  知识库检索", "#4f6ef6"))
+                st.markdown(f"""
+                <div style="margin-bottom:8px;">
+                    <span style="background:{route_color}18;color:{route_color};
+                        padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;">
+                        {route_label}
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # 显示 Agent 思考过程（如果有）
+            agent_steps = message.get("agent_steps", [])
+            if agent_steps:
+                with st.expander(f"  Agent 思考过程 ({len(agent_steps)} 步)"):
+                    for step in agent_steps:
+                        step_icons = {
+                            "think": " ",
+                            "action": "⚡",
+                            "observation": " ",
+                            "answer": " ",
+                        }
+                        icon = step_icons.get(step.step_type, " ")
+                        st.markdown(f"""
+                        <div style="padding:6px 0;border-bottom:1px solid #eee;">
+                            <span style="color:#4f6ef6;font-weight:600;">{icon} {step.agent_name}</span>
+                            <span style="color:#999;font-size:11px;margin-left:8px;">{step.step_type}</span>
+                            <div style="color:#555;font-size:13px;margin-top:4px;line-height:1.5;">
+                                {step.content}
+                            </div>
                         </div>
-                        <div style="color:#64748b;font-size:12px;line-height:1.6;">
-                            {item['snippet']}
+                        """, unsafe_allow_html=True)
+
+            # 如果有引用来源，展示引用区域
+            if message.get("citations"):
+                # st.expander：折叠面板——默认收起，用户点击展开查看引用详情
+                with st.expander(f"  引用来源 ({len(message['citations'])})"):
+                    # 遍历每条引用
+                    for idx, item in enumerate(message["citations"], 1):
+                        # 将相似度分数（0~1）转为百分比（0~100）
+                        score_pct = int(item["score"] * 100)
+                        # 根据百分比分档显示不同颜色：
+                        # >= 70% → 绿色（高相关度）
+                        # >= 50% → 橙色（中等相关度）
+                        # < 50%  → 灰色（低相关度）
+                        score_color = "#10b981" if score_pct >= 70 else "#f59e0b" if score_pct >= 50 else "#94a3b8"
+                        # 渲染引用卡片
+                        st.markdown(f"""
+                        <div class="citation-box">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                                <strong style="color:#1a1f36;">{idx}. {item['source']}</strong>
+                                <span class="citation-score" style="background:{score_color}18;color:{score_color};">
+                                    相关度 {score_pct}%
+                                </span>
+                            </div>
+                            <div style="color:#64748b;font-size:12px;line-height:1.6;">
+                                {item['snippet']}
+                            </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
 
 
 # ---- 聊天输入框 ----
@@ -411,16 +494,64 @@ if user_query:
     # 渲染助手消息区域
     with st.chat_message("assistant"):
         # st.spinner：在等待检索和生成时显示加载动画
-        with st.spinner(""):
-            # 调用核心 Pipeline——ask() 方法串联了检索+生成全流程
+        with st.spinner("Agent 正在思考..."):
+            # 调用 Agent Pipeline——ask() 方法串联了路由→改写→检索→生成全流程
             result = st.session_state.pipeline.ask(user_query)
+
+        # 显示路由决策标签
+        route = result.get("route", "rag")
+        route_labels = {
+            "rag": ("  知识库检索", "#4f6ef6"),
+            "general": ("  通用知识", "#10b981"),
+            "direct": ("  直接回答", "#f59e0b"),
+        }
+        route_label, route_color = route_labels.get(route, ("  知识库检索", "#4f6ef6"))
+        st.markdown(f"""
+        <div style="margin-bottom:8px;">
+            <span style="background:{route_color}18;color:{route_color};
+                padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;">
+                {route_label}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 如果有改写后的查询，显示
+        rewritten = result.get("rewritten_query")
+        if rewritten and rewritten != user_query:
+            st.markdown(f"""
+            <div style="margin-bottom:8px;font-size:12px;color:#888;">
+                优化查询: <em>{rewritten}</em>
+            </div>
+            """, unsafe_allow_html=True)
 
         # 显示 LLM 生成的答案
         st.markdown(result["answer"])
 
+        # 显示 Agent 思考过程（如果有）
+        agent_steps = result.get("agent_steps", [])
+        if agent_steps:
+            with st.expander(f"  Agent 思考过程 ({len(agent_steps)} 步)"):
+                for step in agent_steps:
+                    step_icons = {
+                        "think": " ",
+                        "action": "⚡",
+                        "observation": " ",
+                        "answer": " ",
+                    }
+                    icon = step_icons.get(step.step_type, " ")
+                    st.markdown(f"""
+                    <div style="padding:6px 0;border-bottom:1px solid #eee;">
+                        <span style="color:#4f6ef6;font-weight:600;">{icon} {step.agent_name}</span>
+                        <span style="color:#999;font-size:11px;margin-left:8px;">{step.step_type}</span>
+                        <div style="color:#555;font-size:13px;margin-top:4px;line-height:1.5;">
+                            {step.content}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
         # 如果有引用来源，展示折叠面板
         if result["citations"]:
-            with st.expander(f"引用来源 ({len(result['citations'])})"):
+            with st.expander(f"  引用来源 ({len(result['citations'])})"):
                 for idx, item in enumerate(result["citations"], 1):
                     score_pct = int(item["score"] * 100)
                     score_color = "#10b981" if score_pct >= 70 else "#f59e0b" if score_pct >= 50 else "#94a3b8"
@@ -438,9 +569,11 @@ if user_query:
                     </div>
                     """, unsafe_allow_html=True)
 
-    # 将助手消息追加到对话历史（包括 citations 供后续展示）
+    # 将助手消息追加到对话历史（包括 citations 和 agent_steps 供后续展示）
     st.session_state.messages.append({
         "role": "assistant",
         "content": result["answer"],
         "citations": result["citations"],
+        "agent_steps": result.get("agent_steps", []),
+        "route": result.get("route", "rag"),
     })

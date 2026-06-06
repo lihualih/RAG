@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # config.py — 配置管理中心
 # 负责从 .env 文件加载所有运行参数，提供类型安全的 Settings 不可变配置对象。
 # 核心设计：不可变对象 + 自动校验 + 全局单例缓存
@@ -51,6 +51,12 @@ class Settings:
     chunk_overlap: int
     # similarity_threshold：相似度阈值，低于此分数的检索结果会被丢弃
     similarity_threshold: float
+    # bm25_top_k：BM25 检索返回的最大文档片段数
+    bm25_top_k: int
+    # rrf_k：倒数排名融合（RRF）算法的平滑常数
+    rrf_k: int
+    # agent_max_iterations：Agent 最大推理循环次数（防止无限循环）
+    agent_max_iterations: int
 
     # ---- 类方法：从环境变量构建 Settings ----
     @classmethod
@@ -115,6 +121,9 @@ class Settings:
             chunk_size=_parse_positive_int("CHUNK_SIZE", 512),
             chunk_overlap=_parse_non_negative_int("CHUNK_OVERLAP", 80),
             similarity_threshold=_parse_float("SIMILARITY_THRESHOLD", 0.45),
+            bm25_top_k=_parse_positive_int("BM25_TOP_K", 8),
+            rrf_k=_parse_positive_int("RRF_K", 60),
+            agent_max_iterations=_parse_positive_int("AGENT_MAX_ITERATIONS", 5),
         )
 
 

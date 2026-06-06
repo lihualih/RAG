@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # indexer.py — 索引管理器
 # 负责 ChromaDB 向量库与 LlamaIndex 索引的完整生命周期管理。
 # 核心设计：全局配置 + 索引复用 + 生命周期管理 + 增量和重建接口
@@ -57,6 +57,8 @@ class IndexManager:
             path=str(self.settings.chroma_dir),
             settings=ChromaSettings(anonymized_telemetry=False),
         )
+        # BM25 语料库——存储文档片段的文本和元数据，供 BM25 检索器使用
+        self._bm25_corpus: list[dict] = []
         # 配置 LlamaIndex 的全局参数
         self._configure_llama_index()
 
@@ -205,3 +207,49 @@ class IndexManager:
             "vector_count": collection.count(),        # 向量条目总数
             "chroma_dir": str(self.settings.chroma_dir),  # 持久化目录路径
         }
+
+    def get_bm25_corpus(self) -> list[dict]:
+        """获取 BM25 语料库——从向量索引中提取所有文档片段的文本和元数据。
+
+        BM25 检索需要原始文本语料，而向量索引中存储的是向量。
+        这个方法从 ChromaDB 中提取所有文档片段，构建 BM25 可用的语料库。
+
+        Returns:
+            文档片段列表，每个元素包含 text 和 metadata 字段
+        """
+        # 如果已经提取过，直接返回缓存
+        if self._bm25_corpus:
+            return self._bm25_corpus
+
+        collection = self._get_collection()
+        if collection.count() == 0:
+            logger.warning("ChromaDB 为空，无法构建 BM25 语料库")
+            return []
+
+        # 从 ChromaDB 中获取所有文档片段
+        # include=["documents", "metadatas"] 指定返回文本和元数据
+        try:
+            results = collection.get(
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            logger.warning("从 ChromaDB 提取 BM25 语料失败: %s", exc)
+            return []
+
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+
+        # 构建 BM25 语料库
+        corpus = []
+        for i, text in enumerate(documents):
+            if not text:
+                continue
+            metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
+            corpus.append({
+                "text": text,
+                "metadata": dict(metadata),
+            })
+
+        self._bm25_corpus = corpus
+        logger.info("BM25 语料库构建完成，片段数: %s", len(corpus))
+        return corpus
