@@ -495,8 +495,14 @@ if user_query:
     with st.chat_message("assistant"):
         # st.spinner：在等待检索和生成时显示加载动画
         with st.spinner("Agent 正在思考..."):
+            # 构建对话历史（排除当前刚加入的用户消息）
+            chat_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages[:-1]
+                if m["role"] in ("user", "assistant")
+            ]
             # 调用 Agent Pipeline——ask() 方法串联了路由→改写→检索→生成全流程
-            result = st.session_state.pipeline.ask(user_query)
+            result = st.session_state.pipeline.ask(user_query, history=chat_history)
 
         # 显示路由决策标签
         route = result.get("route", "rag")

@@ -57,6 +57,8 @@ class Settings:
     rrf_k: int
     # agent_max_iterations：Agent 最大推理循环次数（防止无限循环）
     agent_max_iterations: int
+    # max_history_turns：多轮对话记忆的最大轮数（防止上下文窗口溢出）
+    max_history_turns: int
 
     # ---- 类方法：从环境变量构建 Settings ----
     @classmethod
@@ -124,6 +126,7 @@ class Settings:
             bm25_top_k=_parse_positive_int("BM25_TOP_K", 8),
             rrf_k=_parse_positive_int("RRF_K", 60),
             agent_max_iterations=_parse_positive_int("AGENT_MAX_ITERATIONS", 5),
+            max_history_turns=_parse_positive_int("MAX_HISTORY_TURNS", 3),
         )
 
 

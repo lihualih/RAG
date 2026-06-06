@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from openai import OpenAI
 
@@ -77,20 +77,26 @@ class RouterAgent:
         self.client = client
         self.model = model
 
-    def route(self, query: str) -> Dict[str, str]:
+    def route(self, query: str, history: Sequence[Dict[str, str]] = ()) -> Dict[str, str]:
         """分析问题并返回路由决策。
 
+        Args:
+            query: 当前用户问题
+            history: 对话历史，格式 [{"role": "user", "content": "..."}, ...]
         Returns:
             {"route": "rag"|"general"|"direct", "reason": "理由"}
         """
         try:
+            messages = [{"role": "system", "content": self.ROUTE_PROMPT}]
+            # 加入对话历史，帮助判断意图（如"还有呢"、"它怎么用"需要上下文）
+            for msg in history:
+                messages.append(msg)
+            messages.append({"role": "user", "content": query})
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.0,
-                messages=[
-                    {"role": "system", "content": self.ROUTE_PROMPT},
-                    {"role": "user", "content": query},
-                ],
+                messages=messages,
             )
             content = (response.choices[0].message.content or "").strip()
 
@@ -150,19 +156,38 @@ class QueryRewriteAgent:
         self.client = client
         self.model = model
 
-    def rewrite(self, query: str) -> Dict[str, Any]:
-        """改写查询。
+    def rewrite(self, query: str, history: Sequence[Dict[str, str]] = ()) -> Dict[str, Any]:
+        """改写查询，支持对话历史上下文（解决指代消解）。
 
+        Args:
+            query: 当前用户问题
+            history: 对话历史
         Returns:
             {"queries": ["查询1", "查询2"], "explanation": "理由"}
         """
         try:
+            # 如果有历史，构造带上下文的改写请求
+            if history:
+                history_text = "\n".join(
+                    f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+                    for m in history
+                )
+                user_content = (
+                    f"对话历史：\n{history_text}\n\n"
+                    f"当前用户问题：{query}\n\n"
+                    "请基于对话历史理解当前问题的完整含义后改写。"
+                    "特别是如果当前问题中存在代词（如'它'、'这个'、'那个'），"
+                    "请用对话历史中对应的具体术语替换。"
+                )
+            else:
+                user_content = query
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.1,
                 messages=[
                     {"role": "system", "content": self.REWRITE_PROMPT},
-                    {"role": "user", "content": query},
+                    {"role": "user", "content": user_content},
                 ],
             )
             content = (response.choices[0].message.content or "").strip()
@@ -208,16 +233,20 @@ class RetrievalAgent:
         self.model = model
         self.max_iterations = max_iterations
 
-    def run(self, query: str, context: str, tools_description: str) -> Dict[str, Any]:
+    def run(
+        self,
+        query: str,
+        context: str,
+        tools_description: str,
+        history: Sequence[Dict[str, str]] = (),
+    ) -> Dict[str, Any]:
         """执行 ReAct 检索循环。
-
-        如果 LlamaIndex Agent 可用，使用 Agent 自主调用工具。
-        否则回退到基于上下文的直接回答。
 
         Args:
             query: 用户问题（或改写后的查询）
             context: 检索到的上下文（来自混合检索）
             tools_description: 可用工具的描述
+            history: 对话历史
 
         Returns:
             {"answer": "答案", "steps": [AgentStep, ...]}
@@ -226,13 +255,14 @@ class RetrievalAgent:
 
         # 尝试使用 LlamaIndex OpenAIAgent
         try:
-            return self._run_with_llama_agent(query, context, tools_description, steps)
+            return self._run_with_llama_agent(query, context, tools_description, steps, history)
         except Exception as exc:
             logger.info("LlamaIndex Agent 不可用，回退到直接模式: %s", exc)
-            return self._run_direct(query, context, steps)
+            return self._run_direct(query, context, steps, history)
 
     def _run_with_llama_agent(
-        self, query: str, context: str, tools_description: str, steps: List[AgentStep]
+        self, query: str, context: str, tools_description: str,
+        steps: List[AgentStep], history: Sequence[Dict[str, str]] = (),
     ) -> Dict[str, Any]:
         """使用 LlamaIndex OpenAIAgent 执行 ReAct 循环。"""
         from llama_index.agent.openai import OpenAIAgent
@@ -260,6 +290,14 @@ class RetrievalAgent:
             "4. 代码相关问题优先展示代码示例\n"
             "5. 回答保持简洁、专业、面向工程实践"
         )
+
+        # 如果有对话历史，追加到系统提示中
+        if history:
+            history_text = "\n".join(
+                f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+                for m in history
+            )
+            system_prompt += f"\n\n以下是之前的对话记录，供你理解上下文：\n{history_text}"
 
         # 创建 LlamaIndex Agent
         agent = OpenAIAgent.from_tools(
@@ -297,7 +335,10 @@ class RetrievalAgent:
 
         return {"answer": answer, "steps": steps}
 
-    def _run_direct(self, query: str, context: str, steps: List[AgentStep]) -> Dict[str, Any]:
+    def _run_direct(
+        self, query: str, context: str, steps: List[AgentStep],
+        history: Sequence[Dict[str, str]] = (),
+    ) -> Dict[str, Any]:
         """回退模式：直接使用 LLM 基于上下文回答。"""
         steps.append(AgentStep(
             agent_name="Retrieval",
@@ -319,13 +360,16 @@ class RetrievalAgent:
         )
 
         try:
+            messages = [{"role": "system", "content": system_prompt}]
+            # 插入对话历史
+            for msg in history:
+                messages.append(msg)
+            messages.append({"role": "user", "content": user_prompt})
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.1,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=messages,
             )
             answer = (response.choices[0].message.content or "").strip()
             if not answer:

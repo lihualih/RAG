@@ -156,12 +156,22 @@ class AgentRAGPipeline:
         from .agent_tools import init_tools
         init_tools(hybrid_retriever, settings.docs_dir)
 
-    def ask(self, question: str) -> Dict[str, Any]:
+    def ask(self, question: str, history: List[Dict[str, str]] | None = None) -> Dict[str, Any]:
         """Agent 协同问答入口。
 
         流程：路由决策 → 查询改写 → 混合检索 → Agent 生成答案
+
+        Args:
+            question: 当前用户问题
+            history: 对话历史，格式 [{"role": "user/assistant", "content": "..."}]
         """
         from .agent_core import AgentStep
+
+        # 对话历史：取最近 N 轮，防止上下文窗口溢出
+        if history is None:
+            history = []
+        max_turns = self.settings.max_history_turns * 2  # 每轮 = user + assistant
+        recent_history = history[-max_turns:] if max_turns > 0 else []
 
         # ---- Step 0：问题预处理 ----
         clean_question = question.strip()
@@ -176,8 +186,8 @@ class AgentRAGPipeline:
 
         agent_steps: List[AgentStep] = []
 
-        # ---- Step 1：路由决策 ----
-        route_result = self.router.route(clean_question)
+        # ---- Step 1：路由决策（带对话历史） ----
+        route_result = self.router.route(clean_question, history=recent_history)
         route = route_result["route"]
         reason = route_result["reason"]
 
@@ -187,9 +197,9 @@ class AgentRAGPipeline:
             content=f"问题类型: {route} | 理由: {reason}",
         ))
 
-        # ---- Step 2：直接回答（问候/闲聊） ----
+        # ---- Step 2：直接回答（问候/闲聊，带对话历史） ----
         if route == "direct":
-            answer = self._handle_direct(clean_question)
+            answer = self._handle_direct(clean_question, history=recent_history)
             return {
                 "answer": answer,
                 "citations": [],
@@ -198,9 +208,9 @@ class AgentRAGPipeline:
                 "route": route,
             }
 
-        # ---- Step 3：通用知识回答 ----
+        # ---- Step 3：通用知识回答（带对话历史） ----
         if route == "general":
-            answer = self._handle_general(clean_question)
+            answer = self._handle_general(clean_question, history=recent_history)
             return {
                 "answer": answer,
                 "citations": [],
@@ -209,8 +219,8 @@ class AgentRAGPipeline:
                 "route": route,
             }
 
-        # ---- Step 4：RAG 通道——查询改写 ----
-        rewrite_result = self.rewriter.rewrite(clean_question)
+        # ---- Step 4：RAG 通道——查询改写（带对话历史，解决指代消解） ----
+        rewrite_result = self.rewriter.rewrite(clean_question, history=recent_history)
         queries = rewrite_result["queries"]
         explanation = rewrite_result["explanation"]
 
@@ -272,6 +282,7 @@ class AgentRAGPipeline:
             query=clean_question,
             context=context_text,
             tools_description=tools_desc,
+            history=recent_history,
         )
         answer = agent_result["answer"]
         agent_steps.extend(agent_result.get("steps", []))
@@ -303,35 +314,37 @@ class AgentRAGPipeline:
             "rewritten_query": queries[0] if queries else None,
         }
 
-    def _handle_direct(self, question: str) -> str:
-        """处理直接回答（问候/闲聊）。"""
+    def _handle_direct(self, question: str, history: List[Dict[str, str]] | None = None) -> str:
+        """处理直接回答（问候/闲聊），支持对话历史。"""
         try:
+            messages = [{"role": "system", "content": "你是一个友好的技术文档助手。简洁回复用户的问候。"}]
+            if history:
+                messages.extend(history)
+            messages.append({"role": "user", "content": question})
             response = self.client.chat.completions.create(
                 model=self.settings.llm_model,
                 temperature=0.7,
-                messages=[
-                    {"role": "system", "content": "你是一个友好的技术文档助手。简洁回复用户的问候。"},
-                    {"role": "user", "content": question},
-                ],
+                messages=messages,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception:
             return "你好！我是技术文档助手，有什么技术问题可以帮你解答？"
 
-    def _handle_general(self, question: str) -> str:
-        """处理通用技术知识问题。"""
+    def _handle_general(self, question: str, history: List[Dict[str, str]] | None = None) -> str:
+        """处理通用技术知识问题，支持对话历史。"""
         try:
+            messages = [{"role": "system", "content": (
+                "你是一个技术文档助手。请基于你的知识回答技术问题。"
+                "回答简洁、专业、面向工程实践。"
+                "如果不确定，坦诚告知。"
+            )}]
+            if history:
+                messages.extend(history)
+            messages.append({"role": "user", "content": question})
             response = self.client.chat.completions.create(
                 model=self.settings.llm_model,
                 temperature=0.3,
-                messages=[
-                    {"role": "system", "content": (
-                        "你是一个技术文档助手。请基于你的知识回答技术问题。"
-                        "回答简洁、专业、面向工程实践。"
-                        "如果不确定，坦诚告知。"
-                    )},
-                    {"role": "user", "content": question},
-                ],
+                messages=messages,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception as exc:
